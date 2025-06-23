@@ -1,117 +1,130 @@
+//chat_client.c
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <signal.h>
+#include <fcntl.h>
+#include <termios.h>
 
 #define BUFFER_SIZE 1024
-#define SERVER_IP "127.0.0.1"  // 로컬호스트 IP, 필요에 따라 변경
-#define PORT 8080
 
-int sock; // 전역 변수로 소켓 선언 (시그널 핸들러에서 사용)
+int socket_fd;
+int running = 1;
+pid_t child_pid;
 
-// Ctrl+C 시그널 처리 함수
-void handle_sigint(int sig) {
-    printf("\n채팅을 종료합니다...\n");
-    close(sock);
+// 서버로부터 메시지 수신 처리 함수
+void receive_messages() {
+    char buffer[BUFFER_SIZE];
+    int bytes;
+    
+    while (running) {
+        bytes = read(socket_fd, buffer, BUFFER_SIZE - 1);
+        if (bytes <= 0) {
+            printf("서버와의 연결이 종료되었습니다.\n");
+            running = 0;
+            kill(getppid(), SIGTERM);  // 부모 프로세스에게 종료 신호 전송
+            break;
+        }
+        
+        buffer[bytes] = '\0';
+        printf("%s\n", buffer);
+    }
+    
     exit(0);
 }
 
+// 시그널 핸들러 함수
+void handle_signal(int sig) {
+    if (sig == SIGTERM || sig == SIGINT) {
+        running = 0;
+        if (child_pid > 0) {
+            kill(child_pid, SIGTERM);  // 자식 프로세스 종료
+        }
+        close(socket_fd);
+        printf("\n프로그램을 종료합니다.\n");
+        exit(0);
+    }
+}
+
 int main(int argc, char *argv[]) {
-    struct sockaddr_in server;
-    char message[BUFFER_SIZE];
-    char name[50];
-    pid_t pid;
+    struct sockaddr_in server_addr;
+    char buffer[BUFFER_SIZE];
+    
+    // 명령행 인자 확인
+    if (argc != 3) {
+        printf("사용법: %s <서버 주소> <포트>\n", argv[0]);
+        exit(1);
+    }
+    
+    // 시그널 핸들러 설정
+    signal(SIGTERM, handle_signal);
+    signal(SIGINT, handle_signal);
     
     // 소켓 생성
-    sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (sock == -1) {
+    socket_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (socket_fd < 0) {
         perror("소켓 생성 실패");
-        return 1;
+        exit(1);
     }
     
     // 서버 주소 설정
-    server.sin_addr.s_addr = inet_addr(SERVER_IP);
-    server.sin_family = AF_INET;
-    server.sin_port = htons(PORT);
+    memset(&server_addr, 0, sizeof(server_addr));
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(atoi(argv[2]));
+    
+    // 서버 주소 변환
+    if (inet_pton(AF_INET, argv[1], &server_addr.sin_addr) <= 0) {
+        perror("주소 변환 실패");
+        exit(1);
+    }
     
     // 서버에 연결
-    if (connect(sock, (struct sockaddr *)&server, sizeof(server)) < 0) {
+    if (connect(socket_fd, (struct sockaddr *)&server_addr, sizeof(server_addr)) < 0) {
         perror("연결 실패");
-        return 1;
+        exit(1);
     }
     
     printf("서버에 연결되었습니다.\n");
     
-    // 사용자 이름 입력
-    printf("채팅에 사용할 이름을 입력하세요: ");
-    fgets(name, 50, stdin);
-    name[strcspn(name, "\n")] = '\0';  // 개행 문자 제거
+    // 자식 프로세스 생성 (메시지 수신용)
+    child_pid = fork();
     
-    // 서버에 이름 전송
-    if (send(sock, name, strlen(name), 0) < 0) {
-        perror("이름 전송 실패");
-        return 1;
-    }
-    
-    // Ctrl+C 시그널 핸들러 등록
-    signal(SIGINT, handle_sigint);
-    
-    // fork()를 사용하여 메시지 수신과 전송을 분리
-    pid = fork();
-    
-    if (pid < 0) {
-        perror("fork 실패");
-        close(sock);
-        return 1;
-    }
-    
-    if (pid == 0) {  // 자식 프로세스: 메시지 수신 담당
-        char buffer[BUFFER_SIZE];
-        int read_size;
-        
-        while ((read_size = recv(sock, buffer, BUFFER_SIZE, 0)) > 0) {
-            buffer[read_size] = '\0';
-            printf("%s", buffer);
-        }
-        
-        if (read_size == 0) {
-            printf("서버 연결이 종료되었습니다.\n");
-        } else if (read_size == -1) {
-            perror("메시지 수신 실패");
-        }
-        
-        // 부모 프로세스에게 종료 신호 전송
-        kill(getppid(), SIGINT);
-        exit(0);
-    } else {  // 부모 프로세스: 메시지 전송 담당
-        while (1) {
-            fgets(message, BUFFER_SIZE, stdin);
+    if (child_pid < 0) {
+        perror("프로세스 생성 실패");
+        close(socket_fd);
+        exit(1);
+    } else if (child_pid == 0) {
+        // 자식 프로세스 - 메시지 수신 담당
+        receive_messages();
+    } else {
+        // 부모 프로세스 - 메시지 전송 담당
+        while (running) {
+            // 사용자 입력 받기
+            fgets(buffer, BUFFER_SIZE, stdin);
             
-            // 'exit' 입력 시 종료
-            if (strcmp(message, "exit\n") == 0) {
-                send(sock, "exit", 4, 0);
-                break;
-            }
-            
-            // 서버에 메시지 전송
-            if (send(sock, message, strlen(message), 0) < 0) {
+            // 서버로 메시지 전송
+            if (write(socket_fd, buffer, strlen(buffer)) < 0) {
                 perror("메시지 전송 실패");
                 break;
             }
+            
+            // 종료 명령 확인
+            if (strcmp(buffer, "exit\n") == 0) {
+                running = 0;
+                break;
+            }
         }
         
-        // 자식 프로세스 종료
-        kill(pid, SIGINT);
+        // 종료 처리
+        kill(child_pid, SIGTERM);  // 자식 프로세스 종료
+        close(socket_fd);
     }
-    
-    // 소켓 닫기
-    close(sock);
     
     return 0;
 }
