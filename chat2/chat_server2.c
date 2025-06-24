@@ -645,7 +645,7 @@ void handle_client_child_process(int client_fd, int parent_to_child_read_fd, int
 // 메인 함수
 // ===========================================
 int main() {
-    //daemonize(); // 서버를 데몬 프로세스로 동작
+    daemonize(); // 서버를 데몬 프로세스로 동작
 
     int server_socket;
     struct sockaddr_in server_addr;
